@@ -1,0 +1,36 @@
+### Python backend
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+
+### Python local config
+.env
+.env.*
+!.env.example
+
+### Node / Next.js frontend
+node_modules/
+.next/
+out/
+dist/
+coverage/
+*.tsbuildinfo
+
+### Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
