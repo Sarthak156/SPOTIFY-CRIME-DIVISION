@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, Response
+from PIL import Image, ImageColor, ImageDraw, ImageFont
 from pydantic import BaseModel, Field
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
@@ -245,6 +246,36 @@ def download_report_pdf(report_id: str) -> Response:
     )
 
 
+@app.get("/api/report/{report_id}/share-card.png")
+def download_share_card(report_id: str) -> Response:
+    report = REPORT_STORE.get(report_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found.")
+
+    png_bytes = _generate_share_image(report, variant="card")
+    filename = f"spotify-crime-report-{report_id}-card.png"
+    return Response(
+        content=png_bytes,
+        media_type="image/png",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/report/{report_id}/story.png")
+def download_story_image(report_id: str) -> Response:
+    report = REPORT_STORE.get(report_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found.")
+
+    png_bytes = _generate_share_image(report, variant="story")
+    filename = f"spotify-crime-report-{report_id}-story.png"
+    return Response(
+        content=png_bytes,
+        media_type="image/png",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.post("/api/analyze")
 def analyze(payload: AnalyzeRequest) -> dict[str, Any]:
     report = build_report(
@@ -298,9 +329,29 @@ def _spotify_audio_features(track_ids: list[str], access_token: str) -> dict[str
         return {"audio_features": []}
     ids_param = ",".join(track_ids[:100])
     try:
-        return _spotify_get(f"https://api.spotify.com/v1/audio-features?ids={ids_param}", access_token)
+        response = _spotify_get(f"https://api.spotify.com/v1/audio-features?ids={ids_param}", access_token)
     except requests.HTTPError:
-        return {"audio_features": []}
+        response = {"audio_features": []}
+
+    features = response.get("audio_features", []) if isinstance(response, dict) else []
+    feature_ids = {
+        item.get("id")
+        for item in features
+        if isinstance(item, dict) and item.get("id")
+    }
+
+    for track_id in track_ids:
+        if track_id in feature_ids:
+            continue
+        try:
+            detail = _spotify_get(f"https://api.spotify.com/v1/audio-features/{track_id}", access_token)
+        except requests.HTTPError:
+            continue
+        if isinstance(detail, dict) and detail.get("id"):
+            features.append(detail)
+            feature_ids.add(detail["id"])
+
+    return {"audio_features": features}
 
 
 def _normalize_mode(mode: str | None) -> str:
@@ -766,3 +817,168 @@ def _write_section(canvas: Canvas, title: str, lines: list[str], y: float, wrap:
             canvas.drawString(58, y, line)
             y -= 14
     return y - 10
+
+
+def _generate_share_image(report: dict[str, Any], variant: str) -> bytes:
+    width, height = (1200, 1600) if variant == "card" else (1080, 1920)
+    image = Image.new("RGB", (width, height), ImageColor.getrgb("#041009"))
+    draw = ImageDraw.Draw(image)
+
+    _draw_gradient(draw, width, height, "#041009", "#071d10")
+    draw.rounded_rectangle((30, 30, width - 30, height - 30), radius=36, outline=ImageColor.getrgb("#73ff8a"), width=2)
+
+    title_font = _load_font(52 if variant == "card" else 60, bold=True)
+    subtitle_font = _load_font(24 if variant == "card" else 28)
+    body_font = _load_font(22 if variant == "card" else 24)
+    small_font = _load_font(18 if variant == "card" else 20)
+    tiny_font = _load_font(14 if variant == "card" else 16)
+
+    draw.text((60, 60), "SPOTIFY CRIME DIVISION", fill=ImageColor.getrgb("#73ff8a"), font=subtitle_font)
+    draw.text((60, 110), report.get("mode_label", "CLASSIFIED REPORT"), fill=ImageColor.getrgb("#effff1"), font=title_font)
+    draw.text((60, 190), report.get("case_signal", "CLASSIFIED SIGNAL"), fill=ImageColor.getrgb("#9fffb0"), font=subtitle_font)
+
+    _draw_stamp(draw, image.size, report.get("verdict", "CLASSIFIED"))
+
+    meta_top = 280 if variant == "card" else 310
+    meta_cards = [
+        ("Threat", report.get("threat_level", "Unknown")),
+        ("Archetype", report.get("archetype", "Unknown")),
+        ("Tracks", str(report.get("analytics", {}).get("track_count", len(report.get("top_tracks", []))))),
+        ("Artists", str(report.get("analytics", {}).get("artist_count", len(report.get("top_artists", []))))),
+    ]
+    card_width = (width - 140) // 2
+    card_height = 112
+    for index, (label, value) in enumerate(meta_cards):
+        x = 60 + (index % 2) * (card_width + 20)
+        y = meta_top + (index // 2) * (card_height + 18)
+        draw.rounded_rectangle((x, y, x + card_width, y + card_height), radius=22, fill=ImageColor.getrgb("#071c0f"), outline=ImageColor.getrgb("#1f5a2a"))
+        draw.text((x + 18, y + 16), label.upper(), fill=ImageColor.getrgb("#8fe79c"), font=tiny_font)
+        draw.text((x + 18, y + 48), str(value), fill=ImageColor.getrgb("#effff1"), font=body_font)
+
+    chart_y = meta_top + 260
+    _draw_progress_section(draw, report.get("top_tracks", [])[:5], report.get("chart_data", {}).get("track_popularity", []), 60, chart_y, width - 120, title_font=small_font, body_font=tiny_font)
+    chart_y += 300 if variant == "card" else 330
+    _draw_progress_section(draw, report.get("top_artists", [])[:5], report.get("chart_data", {}).get("artist_popularity", []), 60, chart_y, width - 120, title_font=small_font, body_font=tiny_font)
+
+    analytics = report.get("analytics", {})
+    summary_text = [
+        f"Mode: {report.get('mode_label', 'Unknown')}",
+        f"Mood index: {analytics.get('mood_index', 'n/a')}",
+        f"Avg energy: {analytics.get('avg_energy', 'n/a')}",
+        f"Explicit ratio: {analytics.get('explicit_ratio', 'n/a')}%",
+        f"Playlist count: {analytics.get('playlist_count', 0)}",
+        f"Overlaps: short/medium {analytics.get('overlap_short_medium', 0)} | short/long {analytics.get('overlap_short_long', 0)}",
+    ]
+    summary_y = height - 340 if variant == "card" else height - 500
+    draw.rounded_rectangle((60, summary_y, width - 60, summary_y + 220), radius=24, fill=ImageColor.getrgb("#071b0f"), outline=ImageColor.getrgb("#244f2f"))
+    draw.text((84, summary_y + 20), "SUMMARY", fill=ImageColor.getrgb("#73ff8a"), font=small_font)
+    current_y = summary_y + 60
+    for line in summary_text:
+        for wrapped in _wrap_text(draw, line, tiny_font, width - 180):
+            draw.text((84, current_y), wrapped, fill=ImageColor.getrgb("#effff1"), font=tiny_font)
+            current_y += 24
+
+    notes = report.get("insights", [])[:3] + report.get("recommendations", [])[:2]
+    footer_y = height - 90
+    draw.text((60, footer_y), "CLASSIFIED / FOR ENTERTAINMENT USE ONLY", fill=ImageColor.getrgb("#ff6666"), font=tiny_font)
+    draw.text((60, footer_y + 22), "Generated by Spotify Crime Report", fill=ImageColor.getrgb("#9fffb0"), font=tiny_font)
+
+    note_y = 60 if variant == "story" else height - 260
+    note_x = width - 470 if variant == "story" else 60
+    note_w = 410 if variant == "story" else width - 120
+    draw.rounded_rectangle((note_x, note_y, note_x + note_w, note_y + 170), radius=20, fill=ImageColor.getrgb("#0b1a10"), outline=ImageColor.getrgb("#325f3c"))
+    draw.text((note_x + 18, note_y + 16), "KEY NOTES", fill=ImageColor.getrgb("#73ff8a"), font=tiny_font)
+    running_y = note_y + 44
+    for note in notes:
+        for wrapped in _wrap_text(draw, f"• {note}", tiny_font, note_w - 36):
+            draw.text((note_x + 18, running_y), wrapped, fill=ImageColor.getrgb("#effff1"), font=tiny_font)
+            running_y += 20
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _draw_gradient(draw: ImageDraw.ImageDraw, width: int, height: int, top_color: str, bottom_color: str) -> None:
+    top_rgb = ImageColor.getrgb(top_color)
+    bottom_rgb = ImageColor.getrgb(bottom_color)
+    for y in range(height):
+        ratio = y / max(height - 1, 1)
+        color = tuple(int(top_rgb[i] * (1 - ratio) + bottom_rgb[i] * ratio) for i in range(3))
+        draw.line((0, y, width, y), fill=color)
+
+
+def _draw_stamp(draw: ImageDraw.ImageDraw, size: tuple[int, int], text: str) -> None:
+    width, height = size
+    stamp = Image.new("RGBA", (420, 180), (0, 0, 0, 0))
+    stamp_draw = ImageDraw.Draw(stamp)
+    stamp_draw.rounded_rectangle((8, 8, 412, 172), radius=24, outline=(255, 90, 90, 255), width=6)
+    stamp_font = _load_font(44, bold=True)
+    stamp_draw.text((44, 58), text.upper(), fill=(255, 90, 90, 255), font=stamp_font)
+    rotated = stamp.rotate(-18, expand=True)
+    draw.bitmap((width - rotated.size[0] - 50, 90), rotated, fill=None)
+
+
+def _draw_progress_section(
+    draw: ImageDraw.ImageDraw,
+    labels: list[str],
+    series: list[dict[str, Any]],
+    x: int,
+    y: int,
+    width: int,
+    *,
+    title_font: ImageFont.ImageFont,
+    body_font: ImageFont.ImageFont,
+) -> None:
+    section_height = 250
+    draw.rounded_rectangle((x, y, x + width, y + section_height), radius=24, fill=ImageColor.getrgb("#08160d"), outline=ImageColor.getrgb("#204d2d"))
+    draw.text((x + 18, y + 16), "TOP SIGNALS", fill=ImageColor.getrgb("#73ff8a"), font=title_font)
+    bar_y = y + 62
+    bar_count = max(1, min(len(labels), len(series)))
+    max_value = max([float(item.get("value") or 0) for item in series[:bar_count]] + [1])
+    for index in range(bar_count):
+        label = labels[index]
+        value = float(series[index].get("value") or 0)
+        text = _shorten(label, 38)
+        draw.text((x + 18, bar_y), text, fill=ImageColor.getrgb("#effff1"), font=body_font)
+        draw.text((x + width - 96, bar_y), f"{value:.1f}", fill=ImageColor.getrgb("#9fffb0"), font=body_font)
+        bar_top = bar_y + 28
+        draw.rounded_rectangle((x + 18, bar_top, x + width - 18, bar_top + 18), radius=8, fill=ImageColor.getrgb("#0d2213"))
+        fill_width = int((value / max_value) * (width - 36))
+        draw.rounded_rectangle((x + 18, bar_top, x + 18 + fill_width, bar_top + 18), radius=8, fill=ImageColor.getrgb("#73ff8a"))
+        bar_y += 42
+
+
+def _load_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+    candidates = [
+        "arialbd.ttf" if bold else "arial.ttf",
+        "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+        "LiberationSans-Bold.ttf" if bold else "LiberationSans-Regular.ttf",
+    ]
+    for font_name in candidates:
+        try:
+            return ImageFont.truetype(font_name, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
+    words = text.split()
+    if not words:
+        return [""]
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        if draw.textbbox((0, 0), candidate, font=font)[2] <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def _shorten(text: str, length: int) -> str:
+    return text if len(text) <= length else f"{text[: length - 1].rstrip()}…"
