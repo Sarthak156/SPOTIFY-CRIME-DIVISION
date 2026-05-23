@@ -105,6 +105,16 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/")
+def root() -> RedirectResponse:
+    """Root route: redirect to the frontend UI or return a simple health link.
+
+    Render's port scanner may probe `/`, so provide a 302 redirect to the
+    configured frontend URL (or localhost for local development).
+    """
+    return RedirectResponse(url=FRONTEND_URL)
+
+
 @app.get("/api/status")
 def api_status() -> dict[str, Any]:
     spotify_ready = bool(SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET)
